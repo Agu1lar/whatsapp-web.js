@@ -1,0 +1,10 @@
+{
+    "funcionarios": [
+        {
+            "nome": "Maria Silva",
+            "telefone": "5531999999999",
+            "setor": "Logística",
+            "chatIds": []
+        }
+    ]
+}

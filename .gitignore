@@ -61,6 +61,10 @@ typings/
 # dotenv environment variables file
 .env
 
+# Bot state (conversas, logs, cadastro local)
+data/*
+!data/funcionarios.example.json
+
 # next.js build output
 .next
 

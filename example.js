@@ -1,7 +1,9 @@
 const { Client, Location, Poll, List, Buttons, LocalAuth } = require('./index');
+const qrcode = require('qrcode-terminal');
 
 const client = new Client({
     authStrategy: new LocalAuth(),
+    authTimeoutMs: 120000,
     // proxyAuthentication: { username: 'username', password: 'password' },
     /**
      * This option changes the browser name from defined in user agent to custom.
@@ -26,7 +28,9 @@ const client = new Client({
 });
 
 // client initialize does not finish at ready now.
-client.initialize();
+client.initialize().catch((err) => {
+    console.error('Falha ao iniciar:', err);
+});
 
 client.on('loading_screen', (percent, message) => {
     console.log('LOADING SCREEN', percent, message);
@@ -34,7 +38,8 @@ client.on('loading_screen', (percent, message) => {
 
 client.on('qr', async (qr) => {
     // NOTE: This event will not be fired if a session is specified.
-    console.log('QR RECEIVED', qr);
+    console.log('QR RECEIVED - escaneie com o WhatsApp:');
+    qrcode.generate(qr, { small: true });
 });
 
 client.on('code', (code) => {

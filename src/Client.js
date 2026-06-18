@@ -103,6 +103,7 @@ class Client extends EventEmitter {
 
         this.currentIndexHtml = null;
         this.lastLoggedOut = false;
+        this._readyEmitted = false;
 
         Util.setFfmpegPath(this.options.ffmpegPath);
     }
@@ -299,84 +300,95 @@ class Client extends EventEmitter {
             this.pupPage,
             'onAppStateHasSyncedEvent',
             async () => {
-                const authEventPayload =
-                    await this.authStrategy.getAuthEventPayload();
-                /**
-                 * Emitted when authentication is successful
-                 * @event Client#authenticated
-                 */
-                this.emit(Events.AUTHENTICATED, authEventPayload);
+                if (this._readyEmitted) return;
 
-                const injected = await this.pupPage.evaluate(async () => {
-                    return typeof window.WWebJS !== 'undefined';
-                });
-
-                if (!injected) {
-                    if (
-                        this.options.webVersionCache.type === 'local' &&
-                        this.currentIndexHtml
-                    ) {
-                        const { type: webCacheType, ...webCacheOptions } =
-                            this.options.webVersionCache;
-                        const webCache = WebCacheFactory.createWebCache(
-                            webCacheType,
-                            webCacheOptions,
-                        );
-
-                        await webCache.persist(this.currentIndexHtml, version);
-                    }
-
-                    // Load util functions (serializers, helper functions)
-                    await this.pupPage.evaluate(LoadUtils);
-
-                    let start = Date.now();
-                    let res = false;
-                    while (start > Date.now() - 30000) {
-                        // Check window.WWebJS Injection
-                        res = await this.pupPage.evaluate(
-                            'window.WWebJS != undefined',
-                        );
-                        if (res) {
-                            break;
-                        }
-                        await new Promise((r) => setTimeout(r, 200));
-                    }
-                    if (!res) {
-                        throw 'ready timeout';
-                    }
-
+                try {
+                    const authEventPayload =
+                        await this.authStrategy.getAuthEventPayload();
                     /**
-                     * Current connection information
-                     * @type {ClientInfo}
+                     * Emitted when authentication is successful
+                     * @event Client#authenticated
                      */
-                    this.info = new ClientInfo(
-                        this,
-                        await this.pupPage.evaluate(() => {
-                            return {
-                                ...window
-                                    .require('WAWebConnModel')
-                                    .Conn.serialize(),
-                                wid:
-                                    window
-                                        .require('WAWebUserPrefsMeUser')
-                                        .getMaybeMePnUser() ||
-                                    window
-                                        .require('WAWebUserPrefsMeUser')
-                                        .getMaybeMeLidUser(),
-                            };
-                        }),
-                    );
+                    this.emit(Events.AUTHENTICATED, authEventPayload);
 
-                    this.interface = new InterfaceController(this);
+                    const injected = await this.pupPage.evaluate(async () => {
+                        return typeof window.WWebJS !== 'undefined';
+                    });
 
-                    await this.attachEventListeners();
+                    if (!injected) {
+                        if (
+                            this.options.webVersionCache.type === 'local' &&
+                            this.currentIndexHtml
+                        ) {
+                            const { type: webCacheType, ...webCacheOptions } =
+                                this.options.webVersionCache;
+                            const webCache = WebCacheFactory.createWebCache(
+                                webCacheType,
+                                webCacheOptions,
+                            );
+
+                            await webCache.persist(
+                                this.currentIndexHtml,
+                                version,
+                            );
+                        }
+
+                        // Load util functions (serializers, helper functions)
+                        await this.pupPage.evaluate(LoadUtils);
+
+                        let start = Date.now();
+                        let res = false;
+                        while (start > Date.now() - 30000) {
+                            // Check window.WWebJS Injection
+                            res = await this.pupPage.evaluate(
+                                'window.WWebJS != undefined',
+                            );
+                            if (res) {
+                                break;
+                            }
+                            await new Promise((r) => setTimeout(r, 200));
+                        }
+                        if (!res) {
+                            throw 'ready timeout';
+                        }
+
+                        /**
+                         * Current connection information
+                         * @type {ClientInfo}
+                         */
+                        this.info = new ClientInfo(
+                            this,
+                            await this.pupPage.evaluate(() => {
+                                return {
+                                    ...window
+                                        .require('WAWebConnModel')
+                                        .Conn.serialize(),
+                                    wid:
+                                        window
+                                            .require('WAWebUserPrefsMeUser')
+                                            .getMaybeMePnUser() ||
+                                        window
+                                            .require('WAWebUserPrefsMeUser')
+                                            .getMaybeMeLidUser(),
+                                };
+                            }),
+                        );
+
+                        this.interface = new InterfaceController(this);
+
+                        await this.attachEventListeners();
+                    }
+
+                    this._readyEmitted = true;
+                    /**
+                     * Emitted when the client has initialized and is ready to receive messages.
+                     * @event Client#ready
+                     */
+                    this.emit(Events.READY);
+                    this.authStrategy.afterAuthReady();
+                } catch (err) {
+                    this.emit(Events.AUTHENTICATION_FAILURE, String(err));
                 }
-                /**
-                 * Emitted when the client has initialized and is ready to receive messages.
-                 * @event Client#ready
-                 */
-                this.emit(Events.READY);
-                this.authStrategy.afterAuthReady();
             },
         );
         let lastPercent = null;
@@ -401,16 +413,16 @@ class Client extends EventEmitter {
             },
         );
         await this.pupPage.evaluate(() => {
-            window
-                .require('WAWebSocketModel')
-                .Socket.on('change:state', (_AppState, state) => {
-                    window.onAuthAppStateChangedEvent(state);
-                });
-            window
-                .require('WAWebSocketModel')
-                .Socket.on('change:hasSynced', () => {
-                    window.onAppStateHasSyncedEvent();
-                });
+            const socket = window.require('WAWebSocketModel').Socket;
+            socket.on('change:state', (_AppState, state) => {
+                window.onAuthAppStateChangedEvent(state);
+            });
+            socket.on('change:hasSynced', () => {
+                window.onAppStateHasSyncedEvent();
+            });
+            if (socket.hasSynced) {
+                window.onAppStateHasSyncedEvent();
+            }
             const Cmd = window.require('WAWebCmd').Cmd;
             Cmd.on('offline_progress_update_from_bridge', () => {
                 window.onOfflineProgressUpdateEvent(
