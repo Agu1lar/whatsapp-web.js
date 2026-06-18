@@ -7,10 +7,7 @@ const path = require('path');
 const qrcode = require('qrcode-terminal');
 const { Client, LocalAuth, MessageMedia } = require('./index');
 const config = require('./lib/config');
-const {
-    isWithinBusinessHours,
-    getOutsideHoursMessage,
-} = require('./lib/hours');
+const { isWithinBusinessHours } = require('./lib/hours');
 const { SYSTEM } = require('./lib/messages');
 const { isSimpleGreeting } = require('./lib/human-intent');
 const {
@@ -48,6 +45,17 @@ let botPaused = false;
 let waClient = null;
 let reconnecting = false;
 let catalogRefreshTimer = null;
+let clientReady = false;
+
+async function sendChatReply(chat, msg, content, options = {}) {
+    const opts = { ...options };
+    if (msg?.id?._serialized && opts.quote !== false) {
+        opts.quotedMessageId = msg.id._serialized;
+    } else {
+        delete opts.quote;
+    }
+    return chat.sendMessage(content, opts);
+}
 
 function logIncoming(msg, chat, reason) {
     const chatId = chat?.id?._serialized || msg.from;
@@ -74,6 +82,7 @@ function getMessageQueue(chatId) {
             items: [],
             debounceTimer: null,
             processing: false,
+            pendingDrain: false,
         });
     }
     return messageQueues.get(chatId);
@@ -106,11 +115,17 @@ function scheduleMessage(msg, chat) {
 
 async function drainMessageQueue(chatId) {
     const queue = getMessageQueue(chatId);
-    if (queue.processing || queue.items.length === 0) {
+    if (queue.items.length === 0) {
+        return;
+    }
+
+    if (queue.processing) {
+        queue.pendingDrain = true;
         return;
     }
 
     queue.processing = true;
+    queue.pendingDrain = false;
     const batch = queue.items.splice(0);
 
     try {
@@ -122,7 +137,8 @@ async function drainMessageQueue(chatId) {
         await processMessage(last.msg, last.chat, combinedText);
     } finally {
         queue.processing = false;
-        if (queue.items.length > 0) {
+        if (queue.items.length > 0 || queue.pendingDrain) {
+            queue.pendingDrain = false;
             await drainMessageQueue(chatId);
         }
     }
@@ -211,6 +227,7 @@ async function handleAdminCommand(msg) {
                 `!docs — reindexar documentos\n` +
                 `!limpar — zerar histórico deste chat\n` +
                 `!liberar [filtro] — liberar escalonamentos\n` +
+                `!ping — teste rápido\n` +
                 `!meunumero — número do WhatsApp conectado`,
         );
         return true;
@@ -241,6 +258,15 @@ async function handleAdminCommand(msg) {
         return true;
     }
 
+    if (text === '!ping') {
+        await msg.reply(
+            `Bot ativo.\n- WhatsApp: ${clientReady ? 'pronto' : 'sincronizando'}\n` +
+                `- IA: ${botPaused ? 'pausada' : 'ativa'}\n` +
+                `- Documentos: ${documentCatalog.length}`,
+        );
+        return true;
+    }
+
     if (text === '!limpar') {
         const chat = await msg.getChat();
         const chatId = chat.id._serialized;
@@ -268,7 +294,7 @@ async function handleAdminCommand(msg) {
     return false;
 }
 
-async function maybeSendDocuments(msg, relativePaths) {
+async function maybeSendDocuments(chat, msg, relativePaths) {
     if (relativePaths.length === 0) {
         return false;
     }
@@ -288,7 +314,7 @@ async function maybeSendDocuments(msg, relativePaths) {
 
         const media = MessageMedia.fromFilePath(filePath);
         const caption = path.basename(filePath);
-        await msg.reply(media, undefined, { caption });
+        await sendChatReply(chat, msg, media, { caption });
         sent += 1;
     }
 
@@ -320,7 +346,14 @@ async function handleEscalation(
         },
     );
 
-    await msg.reply(ESCALATION_REPLY);
+    await sendChatReply(
+        chat,
+        msg,
+        isWithinBusinessHours()
+            ? ESCALATION_REPLY
+            : SYSTEM.escalationOutsideHours,
+        { quote: false },
+    );
 
     const staffLabel = registeredStaff
         ? `${registeredStaff.nome} (${registeredStaff.telefone})`
@@ -342,7 +375,15 @@ async function handleEscalation(
 }
 
 async function handleMessage(msg) {
-    if (msg.fromMe || msg.isStatus || msg.broadcast) return;
+    if (msg.isStatus || msg.broadcast) return;
+
+    if (msg.fromMe) {
+        const preview = (msg.body || '').slice(0, 60);
+        console.log(
+            `[msg] ignorado (fromMe) — teste de outro celular: "${preview}"`,
+        );
+        return;
+    }
 
     let chat;
     try {
@@ -357,6 +398,16 @@ async function handleMessage(msg) {
         return;
     }
 
+    if (!clientReady) {
+        logIncoming(msg, chat, 'ignored_not_ready');
+        try {
+            await sendChatReply(chat, msg, SYSTEM.notReady, { quote: false });
+        } catch {
+            /* ignore */
+        }
+        return;
+    }
+
     if (isAdmin(msg) || !config.adminPhone) {
         const handled = await handleAdminCommand(msg);
         if (handled) return;
@@ -366,7 +417,7 @@ async function handleMessage(msg) {
 
     if (!userText) {
         logIncoming(msg, chat, 'empty_body');
-        await msg.reply(SYSTEM.emptyBody);
+        await sendChatReply(chat, msg, SYSTEM.emptyBody, { quote: false });
         return;
     }
 
@@ -411,7 +462,9 @@ async function processMessage(msg, chat, userText) {
                     `[${chat.name || chatId}] escalonamento cancelado — nova solicitação`,
                 );
             } else {
-                await msg.reply(SYSTEM.escalationWaiting);
+                await sendChatReply(chat, msg, SYSTEM.escalationWaiting, {
+                    quote: false,
+                });
                 appendLog({
                     type: 'message_while_escalated',
                     chatId,
@@ -424,19 +477,11 @@ async function processMessage(msg, chat, userText) {
         if (botPaused) {
             console.log(`[${chat.name || chatId}] bot pausado — ignorado`);
             appendLog({ type: 'bot_paused', chatId, message: userText });
-            if (isAdmin(msg)) {
-                await msg.reply(
-                    'Bot pausado. Envie !ativar para retomar o atendimento automático.',
-                );
-            }
+            await sendChatReply(chat, msg, SYSTEM.botPaused, { quote: false });
             return;
         }
 
-        if (!isWithinBusinessHours()) {
-            await msg.reply(getOutsideHoursMessage());
-            appendLog({ type: 'outside_hours', chatId, message: userText });
-            return;
-        }
+        const outsideBusinessHours = !isWithinBusinessHours();
 
         if (matchesHumanKeyword(userText)) {
             await handleEscalation(
@@ -453,6 +498,7 @@ async function processMessage(msg, chat, userText) {
         await withTyping(chat, async () => {
             const context = await buildContext(userText, documentCatalog, {
                 hasMedia: msg.hasMedia,
+                outsideBusinessHours,
             });
 
             if (needsSlowLookup(userText, context.intent)) {
@@ -460,7 +506,9 @@ async function processMessage(msg, chat, userText) {
                     `[${chat.name || chatId}] busca — avisando contato`,
                 );
                 try {
-                    await msg.reply(SYSTEM.slowLookup);
+                    await sendChatReply(chat, msg, SYSTEM.slowLookup, {
+                        quote: false,
+                    });
                 } catch {
                     /* ignore */
                 }
@@ -501,15 +549,17 @@ async function processMessage(msg, chat, userText) {
                 },
             );
 
-            await msg.reply(outgoing);
+            await sendChatReply(chat, msg, outgoing, { quote: false });
 
             const sentFiles =
                 sendPaths.length > 0
-                    ? await maybeSendDocuments(msg, sendPaths)
+                    ? await maybeSendDocuments(chat, msg, sendPaths)
                     : false;
 
             if (relativePath && !sentFiles) {
-                await msg.reply(SYSTEM.fileNotFound);
+                await sendChatReply(chat, msg, SYSTEM.fileNotFound, {
+                    quote: false,
+                });
             }
 
             appendLog({
@@ -518,6 +568,7 @@ async function processMessage(msg, chat, userText) {
                 contact: registeredStaff?.nome || chat.name,
                 registered: Boolean(registeredStaff),
                 intent: context.intent,
+                outsideBusinessHours,
                 message: userText,
                 reply: outgoing,
                 file: sendPaths.length === 1 ? sendPaths[0] : sendPaths,
@@ -540,7 +591,7 @@ async function processMessage(msg, chat, userText) {
             stack: err.stack,
         });
         try {
-            await msg.reply(SYSTEM.error);
+            await sendChatReply(chat, msg, SYSTEM.error, { quote: false });
         } catch {
             /* ignore */
         }
@@ -567,17 +618,144 @@ if (!config.groqApiKey) {
 
 ensureDataDirs();
 
-const client = new Client({
-    authStrategy: new LocalAuth({ clientId: 'acesso-bot' }),
-    authTimeoutMs: 120000,
-    webVersion: '2.3000.1041720460',
-    puppeteer: {
-        headless: false,
-        args: ['--disable-gpu', '--no-sandbox'],
-    },
-});
+function buildClientOptions() {
+    return {
+        authStrategy: new LocalAuth({ clientId: 'acesso-bot' }),
+        authTimeoutMs: config.authTimeoutMs,
+        // Sem webVersion fixo — usa cache local e, se faltar, o WhatsApp Web ao vivo.
+        webVersionCache: {
+            type: 'local',
+            strict: false,
+        },
+        puppeteer: {
+            headless: config.puppeteerHeadless,
+            defaultViewport: null,
+            args: [
+                '--disable-gpu',
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--no-first-run',
+                '--disable-extensions',
+            ],
+        },
+    };
+}
+
+const client = new Client(buildClientOptions());
 
 waClient = client;
+
+function isSessionError(error) {
+    const text = String(error?.message || error || '').toLowerCase();
+    return (
+        text.includes('target closed') ||
+        text.includes('targetcloseerror') ||
+        text.includes('execution context was destroyed') ||
+        (text.includes('protocol error') &&
+            !text.includes('err_name_not_resolved'))
+    );
+}
+
+function isNetworkError(error) {
+    const text = String(error?.message || error || '').toLowerCase();
+    return (
+        text.includes('err_name_not_resolved') ||
+        text.includes('err_internet_disconnected') ||
+        text.includes('err_connection_refused') ||
+        text.includes('err_connection_reset') ||
+        text.includes('err_connection_timed_out') ||
+        text.includes('err_network_changed') ||
+        text.includes('enotfound') ||
+        text.includes('enetunreach') ||
+        text.includes('econnrefused')
+    );
+}
+
+function logSessionResetHint() {
+    console.error(
+        '\n>>> Sessão WhatsApp possivelmente corrompida.\n' +
+            '    1. Feche todas as instâncias do bot\n' +
+            '    2. Apague a pasta .wwebjs_auth/session-acesso-bot\n' +
+            '    3. (Opcional) Apague .wwebjs_cache\n' +
+            '    4. Rode npm run bot e escaneie o QR Code de novo\n',
+    );
+}
+
+function logNetworkHint() {
+    console.error(
+        '\n>>> Sem acesso a web.whatsapp.com (erro de rede/DNS).\n' +
+            '    1. Abra https://web.whatsapp.com no Chrome deste PC\n' +
+            '    2. Confira internet, Wi-Fi e VPN\n' +
+            '    3. Rede da empresa pode bloquear WhatsApp — fale com TI\n' +
+            '    4. Tente outro DNS (ex.: 8.8.8.8) ou aguarde e rode npm run bot de novo\n',
+    );
+}
+
+async function initializeClientWithRetry() {
+    let lastError;
+
+    for (let attempt = 1; attempt <= config.waInitRetries; attempt++) {
+        try {
+            if (attempt > 1) {
+                await client.destroy().catch(() => {});
+                statusLog(
+                    `Tentativa ${attempt}/${config.waInitRetries} de conectar ao WhatsApp Web…`,
+                );
+            }
+            await client.initialize();
+            return;
+        } catch (err) {
+            lastError = err;
+            const retryable = isNetworkError(err) || isSessionError(err);
+            console.error(
+                `Falha ao iniciar (tentativa ${attempt}/${config.waInitRetries}):`,
+                err.message,
+            );
+
+            if (!retryable || attempt === config.waInitRetries) {
+                break;
+            }
+
+            statusLog(
+                `Aguardando ${config.waInitRetryDelayMs / 1000}s para tentar de novo…`,
+            );
+            await new Promise((resolve) =>
+                setTimeout(resolve, config.waInitRetryDelayMs),
+            );
+        }
+    }
+
+    throw lastError;
+}
+
+async function reconnectClient(reason) {
+    if (reconnecting) return;
+
+    reconnecting = true;
+    statusLog(
+        `Reconectando em ${config.reconnectDelayMs / 1000}s (${reason})…`,
+    );
+
+    await new Promise((resolve) =>
+        setTimeout(resolve, config.reconnectDelayMs),
+    );
+
+    try {
+        await client.destroy().catch(() => {});
+        await initializeClientWithRetry();
+        statusLog('Reconexão iniciada.');
+    } catch (err) {
+        console.error('Falha ao reconectar:', err.message);
+        if (isNetworkError(err)) {
+            logNetworkHint();
+        } else if (isSessionError(err)) {
+            logSessionResetHint();
+        }
+    } finally {
+        reconnecting = false;
+    }
+}
 
 function statusLog(message) {
     const ts = new Date().toLocaleTimeString('pt-BR');
@@ -602,8 +780,14 @@ client.on('change_state', (state) => {
 });
 
 client.on('ready', async () => {
+    clientReady = true;
     const adminDigits = formatPhoneForAdmin(client.info?.wid);
     statusLog('Assistente Acesso Equipamentos conectado e pronto.');
+    console.log(
+        '\n>>> Para testar: envie mensagem DE OUTRO celular para este WhatsApp.\n' +
+            '    Mensagens enviadas por este próprio número são ignoradas.\n' +
+            '    Admin: !ping | !status | !ativar | !pausar\n',
+    );
     refreshDocumentCatalog().catch((err) => {
         console.error(
             'Erro ao indexar documentos (bot continua ativo):',
@@ -633,33 +817,25 @@ client.on('message', (msg) => {
 
 client.on('auth_failure', (msg) => {
     console.error('Falha de autenticação WhatsApp:', msg);
+    if (isSessionError(msg)) {
+        logSessionResetHint();
+    } else {
+        statusLog(
+            'Não foi possível restaurar a sessão. Apague .wwebjs_auth/session-acesso-bot e escaneie o QR de novo.',
+        );
+    }
 });
 
 client.on('disconnected', (reason) => {
+    clientReady = false;
     console.error('WhatsApp desconectado:', reason);
-    if (reconnecting) return;
-
-    reconnecting = true;
-    statusLog(`Reconectando em ${config.reconnectDelayMs / 1000}s…`);
-
-    setTimeout(() => {
-        client
-            .initialize()
-            .then(() => {
-                statusLog('Reconexão iniciada.');
-            })
-            .catch((err) => {
-                console.error('Falha ao reconectar:', err.message);
-            })
-            .finally(() => {
-                reconnecting = false;
-            });
-    }, config.reconnectDelayMs);
+    reconnectClient(reason).catch((err) => {
+        console.error('Erro ao reconectar:', err.message);
+    });
 });
 
 statusLog('Iniciando WhatsApp Web…');
-client
-    .initialize()
+initializeClientWithRetry()
     .then(() => {
         statusLog(
             'Navegador aberto — aguardando sincronização (pode levar 1–2 min)…',
@@ -674,5 +850,10 @@ client
     })
     .catch((err) => {
         console.error('Falha ao iniciar:', err);
+        if (isNetworkError(err)) {
+            logNetworkHint();
+        } else if (isSessionError(err)) {
+            logSessionResetHint();
+        }
         process.exit(1);
     });

@@ -26,65 +26,94 @@
 > **Este repositório é um fork** de [wwebjs/whatsapp-web.js](https://github.com/wwebjs/whatsapp-web.js) ([upstream](https://github.com/wwebjs/whatsapp-web.js)).  
 > Repositório deste fork: [Agu1lar/whatsapp-web.js](https://github.com/Agu1lar/whatsapp-web.js)
 
-Mantido para o **bot de atendimento da Acesso Equipamentos** (área de tecnologia): assistente com IA no WhatsApp, consulta de documentos e e-mail via Outlook no Windows.
+Mantido para o **bot de atendimento da Acesso Equipamentos** (área de tecnologia): assistente virtual do José no WhatsApp, com IA (Groq), consulta de documentos na rede/local e e-mail via Outlook no Windows.
 
 ### Recursos do bot
 
-| Recurso              | Descrição                                                                |
-| -------------------- | ------------------------------------------------------------------------ |
-| **Groq (Llama 3.3)** | Respostas em português, tom natural de WhatsApp                          |
-| **Documentos**       | Indexa pasta local ou de rede (`DOCS_ROOT`) e envia arquivos sob demanda |
-| **Outlook COM**      | Lê e-mails quando pedido explicitamente (Outlook aberto no Windows)      |
-| **Expediente**       | Responde só em horário comercial configurável                            |
-| **Escalonamento**    | Encaminha para o José em pedidos explícitos de atendimento humano        |
-| **Comandos admin**   | `!pausar`, `!ativar`, `!status`, `!docs`, `!liberar`, `!meunumero`       |
+| Recurso                     | Descrição                                                                                           |
+| --------------------------- | --------------------------------------------------------------------------------------------------- |
+| **IA (Groq / Llama 3.3)**   | Respostas em português, tom profissional de atendimento corporativo                                 |
+| **Roteamento por intenção** | Saudação, documento, e-mail, escalonamento humano ou conversa geral                                 |
+| **Documentos**              | Indexa `DOCS_ROOT` (pasta local ou `\\rede`), busca por nome/conteúdo e envio sob demanda           |
+| **Base de conhecimento**    | Arquivos `.md` em `documentos/` entram no contexto da IA                                            |
+| **Outlook**                 | Lê e-mails quando pedido explicitamente (`OUTLOOK_MODE=com` no Windows)                             |
+| **Expediente humano**       | Seg–sex, 07:30–17:15 — fora disso a IA **continua** atendendo; o José retorna no próximo expediente |
+| **Escalonamento**           | Encaminha ao José em pedidos explícitos (ex.: "falar com o José")                                   |
+| **Histórico por contato**   | Conversas isoladas por telefone (suporte a `@lid` do WhatsApp)                                      |
+| **Debounce**                | Agrupa mensagens seguidas (~0,8s saudações / ~3s demais) antes de responder                         |
+| **Envio seguro**            | Só envia arquivo com confirmação da IA ou match exato; evita mandar PDF errado                      |
+| **Resiliência**             | Retry na Groq, timeout de rede, reconexão WhatsApp, reindexação automática de docs                  |
+| **Comandos admin**          | `!ping`, `!status`, `!pausar`, `!ativar`, `!docs`, `!limpar`, `!liberar`, `!ajuda`, `!meunumero`    |
+
+### Comportamento importante
+
+- **Teste de outro celular:** mensagens enviadas pelo próprio WhatsApp conectado ao bot são ignoradas (`fromMe`). Use outro aparelho para testar.
+- **Fora do expediente:** dúvidas, busca em documentos e envio de arquivos funcionam normalmente; apenas o retorno **humano** do José fica para o horário comercial.
+- **Tom:** mensagens fixas em `lib/messages.js` — linguagem profissional, sem parecer o José respondendo pessoalmente.
 
 ### Início rápido
 
-Requisitos: **Node.js 18+**, **Windows** (para Outlook COM), conta [Groq](https://console.groq.com/) com API key.
+Requisitos: **Node.js 18+**, **Windows** (para Outlook COM), conta [Groq](https://console.groq.com/) com API key, acesso a `https://web.whatsapp.com`.
 
 ```powershell
 git clone https://github.com/Agu1lar/whatsapp-web.js.git
 cd whatsapp-web.js
 npm install
 copy .env.example .env
-# Edite .env: GROQ_API_KEY, ADMIN_PHONE, DOCS_ROOT, etc.
+# Edite .env: GROQ_API_KEY, ADMIN_PHONE, DOCS_ROOT, BUSINESS_END=17:15, etc.
 copy data\funcionarios.example.json data\funcionarios.json
 npm run bot
 ```
 
 Na primeira execução, escaneie o QR Code no terminal. A sessão fica salva em `.wwebjs_auth/` (não versionada).
 
+Se der erro de autenticação ou `Target closed`, apague `.wwebjs_auth/session-acesso-bot` e escaneie o QR de novo.
+
 ### Configuração (`.env`)
 
 Copie `.env.example` para `.env`. Principais variáveis:
 
-| Variável                          | Descrição                                                        |
-| --------------------------------- | ---------------------------------------------------------------- |
-| `GROQ_API_KEY`                    | Chave da API Groq                                                |
-| `GROQ_MODEL`                      | Modelo (padrão: `llama-3.3-70b-versatile`)                       |
-| `DOCS_ROOT`                       | Pasta com documentos (ex.: `\\servidor\pasta` ou `./documentos`) |
-| `ADMIN_PHONE`                     | Seu número com DDI (55…) — comandos admin e alertas              |
-| `BUSINESS_START` / `BUSINESS_END` | Expediente (padrão: 07:30–15:15, seg–sex)                        |
-| `OUTLOOK_MODE`                    | `com` (Outlook desktop) ou `graph` (Azure)                       |
-| `OUTLOOK_USER_EMAIL`              | Caixa de e-mail consultada                                       |
+| Variável                                           | Descrição                                                        |
+| -------------------------------------------------- | ---------------------------------------------------------------- |
+| `GROQ_API_KEY`                                     | Chave da API Groq                                                |
+| `GROQ_MODEL`                                       | Modelo (padrão: `llama-3.3-70b-versatile`)                       |
+| `GROQ_REQUEST_TIMEOUT_MS`                          | Timeout por chamada à IA (padrão: 45000)                         |
+| `DOCS_ROOT`                                        | Pasta com documentos (ex.: `\\servidor\pasta` ou `./documentos`) |
+| `ADMIN_PHONE`                                      | Seu número com DDI (55…) — comandos admin e alertas              |
+| `BUSINESS_START` / `BUSINESS_END`                  | Expediente **humano** (padrão: 07:30–**17:15**, seg–sex)         |
+| `MESSAGE_DEBOUNCE_MS`                              | Espera antes de responder (padrão: 3000)                         |
+| `MESSAGE_DEBOUNCE_GREETING_MS`                     | Debounce para saudações (padrão: 800)                            |
+| `HISTORY_LIMIT_REGISTERED` / `HISTORY_LIMIT_GUEST` | Tamanho do histórico na IA                                       |
+| `PUPPETEER_HEADLESS`                               | `false` = janela do Chrome visível (recomendado para depurar)    |
+| `WA_INIT_RETRIES`                                  | Tentativas ao conectar ao WhatsApp Web                           |
+| `OUTLOOK_MODE`                                     | `com` (Outlook desktop) ou `graph` (Azure)                       |
+| `OUTLOOK_USER_EMAIL`                               | Caixa de e-mail consultada                                       |
+
+Cadastre funcionários em `data/funcionarios.json` (nome, telefone, setor) para tratamento personalizado.
 
 Arquivos **não versionados** (ver `.gitignore`): `.env`, `data/`, `.wwebjs_auth/`, `.wwebjs_cache/`.
 
 ### Estrutura do bot
 
 ```
-bot.js              # Orquestrador principal
+bot.js                 # Orquestrador: fila, WhatsApp, admin, envio de arquivos
 lib/
-  groq.js           # Prompt e chamadas à IA
-  documents.js      # Indexação, busca e envio de arquivos
-  mail.js           # E-mail (Outlook COM / Graph)
-  hours.js          # Expediente
-  human-intent.js   # Detecção de pedido de atendente
-  conversations.js  # Histórico e logs em data/
+  assistant.js         # Orquestra contexto, IA e resolução de arquivos
+  intent.js            # Classificação de intenção da mensagem
+  groq.js              # Prompt, saudações e chamadas à Groq
+  documents.js         # Indexação, busca e envio de arquivos
+  knowledge.js         # Carrega .md da empresa
+  messages.js          # Mensagens fixas do sistema (tom profissional)
+  mail.js              # E-mail (Outlook COM / Graph)
+  hours.js             # Expediente e contexto de data/hora
+  human-intent.js      # Detecção de pedido de atendente / saudação
+  conversations.js     # Histórico por contato e locks de gravação
+  funcionarios.js      # Cadastro de funcionários
 scripts/
   outlook-com-read.ps1
-  outlook-auth.js   # npm run outlook-auth (modo Graph)
+  outlook-auth.js      # npm run outlook-auth (modo Graph)
+documentos/
+  *.md                 # Conhecimento da empresa (lido pela IA)
 ```
 
 ### Alterações em relação ao upstream
