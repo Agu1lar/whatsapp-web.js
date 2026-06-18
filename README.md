@@ -19,6 +19,86 @@
     </p>
 </div>
 
+---
+
+## Fork — Acesso Equipamentos
+
+> **Este repositório é um fork** de [wwebjs/whatsapp-web.js](https://github.com/wwebjs/whatsapp-web.js) ([upstream](https://github.com/wwebjs/whatsapp-web.js)).  
+> Repositório deste fork: [Agu1lar/whatsapp-web.js](https://github.com/Agu1lar/whatsapp-web.js)
+
+Mantido para o **bot de atendimento da Acesso Equipamentos** (área de tecnologia): assistente com IA no WhatsApp, consulta de documentos e e-mail via Outlook no Windows.
+
+### Recursos do bot
+
+| Recurso              | Descrição                                                                |
+| -------------------- | ------------------------------------------------------------------------ |
+| **Groq (Llama 3.3)** | Respostas em português, tom natural de WhatsApp                          |
+| **Documentos**       | Indexa pasta local ou de rede (`DOCS_ROOT`) e envia arquivos sob demanda |
+| **Outlook COM**      | Lê e-mails quando pedido explicitamente (Outlook aberto no Windows)      |
+| **Expediente**       | Responde só em horário comercial configurável                            |
+| **Escalonamento**    | Encaminha para o José em pedidos explícitos de atendimento humano        |
+| **Comandos admin**   | `!pausar`, `!ativar`, `!status`, `!docs`, `!liberar`, `!meunumero`       |
+
+### Início rápido
+
+Requisitos: **Node.js 18+**, **Windows** (para Outlook COM), conta [Groq](https://console.groq.com/) com API key.
+
+```powershell
+git clone https://github.com/Agu1lar/whatsapp-web.js.git
+cd whatsapp-web.js
+npm install
+copy .env.example .env
+# Edite .env: GROQ_API_KEY, ADMIN_PHONE, DOCS_ROOT, etc.
+copy data\funcionarios.example.json data\funcionarios.json
+npm run bot
+```
+
+Na primeira execução, escaneie o QR Code no terminal. A sessão fica salva em `.wwebjs_auth/` (não versionada).
+
+### Configuração (`.env`)
+
+Copie `.env.example` para `.env`. Principais variáveis:
+
+| Variável                          | Descrição                                                        |
+| --------------------------------- | ---------------------------------------------------------------- |
+| `GROQ_API_KEY`                    | Chave da API Groq                                                |
+| `GROQ_MODEL`                      | Modelo (padrão: `llama-3.3-70b-versatile`)                       |
+| `DOCS_ROOT`                       | Pasta com documentos (ex.: `\\servidor\pasta` ou `./documentos`) |
+| `ADMIN_PHONE`                     | Seu número com DDI (55…) — comandos admin e alertas              |
+| `BUSINESS_START` / `BUSINESS_END` | Expediente (padrão: 07:30–15:15, seg–sex)                        |
+| `OUTLOOK_MODE`                    | `com` (Outlook desktop) ou `graph` (Azure)                       |
+| `OUTLOOK_USER_EMAIL`              | Caixa de e-mail consultada                                       |
+
+Arquivos **não versionados** (ver `.gitignore`): `.env`, `data/`, `.wwebjs_auth/`, `.wwebjs_cache/`.
+
+### Estrutura do bot
+
+```
+bot.js              # Orquestrador principal
+lib/
+  groq.js           # Prompt e chamadas à IA
+  documents.js      # Indexação, busca e envio de arquivos
+  mail.js           # E-mail (Outlook COM / Graph)
+  hours.js          # Expediente
+  human-intent.js   # Detecção de pedido de atendente
+  conversations.js  # Histórico e logs em data/
+scripts/
+  outlook-com-read.ps1
+  outlook-auth.js   # npm run outlook-auth (modo Graph)
+```
+
+### Alterações em relação ao upstream
+
+Além do bot e das libs em `lib/`, este fork inclui ajustes em `src/Client.js`:
+
+- Correção de **race condition** no evento `ready` (sessão restaurada com `hasSynced` já true)
+- Proteção contra emissão duplicada de `ready`
+- Tratamento de erro em `onAppStateHasSyncedEvent`
+
+Para usar **apenas a biblioteca** original, consulte a documentação abaixo ou o repositório [upstream](https://github.com/wwebjs/whatsapp-web.js).
+
+---
+
 ## About
 
 whatsapp‑web.js is a powerful [Node.js][nodejs] library that lets you interact with WhatsApp Web, making it easy to build a dynamic WhatsApp API with nearly all features of the web client. It uses [Puppeteer][puppeteer] to access WhatsApp Web’s internal functions and runs them in a managed browser instance to reduce the risk of being blocked.
