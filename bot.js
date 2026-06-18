@@ -11,6 +11,8 @@ const {
     isWithinBusinessHours,
     getOutsideHoursMessage,
 } = require('./lib/hours');
+const { SYSTEM } = require('./lib/messages');
+const { isSimpleGreeting } = require('./lib/human-intent');
 const {
     findRegisteredStaff,
     registerChatIdForStaff,
@@ -20,39 +22,32 @@ const {
 const {
     loadAllStates,
     saveAllStates,
-    getConversationKey,
-    getConversation,
+    resolveConversationKey,
+    withConversationState,
+    readConversation,
     appendLog,
 } = require('./lib/conversations');
 const {
-    loadCatalog,
-    searchCatalog,
-    buildCatalogSummary,
-    buildRelevantContext,
-    resolveDocument,
-} = require('./lib/documents');
-const {
-    isConfigured: mailConfigured,
-    getModeLabel,
-    searchEmails,
-    buildEmailContext,
-    shouldSearchOutlook,
-    parseEmailRequest,
-} = require('./lib/mail');
-const {
-    generateReply,
-    parseSendFileDirective,
-    matchesHumanKeyword,
-} = require('./lib/groq');
+    refreshCompanyKnowledge,
+    extractMessageText,
+    withTyping,
+    buildContext,
+    produceReply,
+    resolveOutgoingFiles,
+    shouldAnnounceLookup,
+} = require('./lib/assistant');
+const { matchesHumanKeyword } = require('./lib/groq');
+const { resolveDocument } = require('./lib/documents');
+const { isConfigured: mailConfigured, getModeLabel } = require('./lib/mail');
 
-const ESCALATION_REPLY =
-    'Beleza, entendi! Vou avisar o José aqui e ele te retorna assim que puder 👍';
+const ESCALATION_REPLY = SYSTEM.escalation;
 
-const processing = new Map();
-const PROCESSING_STALE_MS = 3 * 60 * 1000;
+const messageQueues = new Map();
 let documentCatalog = [];
 let botPaused = false;
 let waClient = null;
+let reconnecting = false;
+let catalogRefreshTimer = null;
 
 function logIncoming(msg, chat, reason) {
     const chatId = chat?.id?._serialized || msg.from;
@@ -69,32 +64,88 @@ function logIncoming(msg, chat, reason) {
     });
 }
 
-function isProcessing(chatId) {
-    const startedAt = processing.get(chatId);
-    if (!startedAt) return false;
-
-    if (Date.now() - startedAt > PROCESSING_STALE_MS) {
-        console.warn(`[${chatId}] lock expirado — liberando`);
-        processing.delete(chatId);
-        return false;
-    }
-
-    return true;
+function needsSlowLookup(text, intent) {
+    return shouldAnnounceLookup(intent, text);
 }
 
-function needsSlowLookup(text) {
-    const n = text.toLowerCase();
-    return (
-        /certificado|documento|arquivo|pdf|anexo|manual|procedimento/.test(n) ||
-        /manda|envia|preciso|busca|procura/.test(n)
-    );
+function getMessageQueue(chatId) {
+    if (!messageQueues.has(chatId)) {
+        messageQueues.set(chatId, {
+            items: [],
+            debounceTimer: null,
+            processing: false,
+        });
+    }
+    return messageQueues.get(chatId);
+}
+
+function scheduleMessage(msg, chat) {
+    const chatId = chat.id._serialized;
+    const queue = getMessageQueue(chatId);
+    queue.items.push({ msg, chat });
+
+    const preview = extractMessageText(msg);
+    const debounceMs = isSimpleGreeting(preview)
+        ? config.messageDebounceGreetingMs
+        : config.messageDebounceMs;
+
+    if (queue.debounceTimer) {
+        clearTimeout(queue.debounceTimer);
+    }
+
+    queue.debounceTimer = setTimeout(() => {
+        queue.debounceTimer = null;
+        drainMessageQueue(chatId).catch((err) => {
+            console.error(
+                `[${chatId}] Erro na fila de mensagens:`,
+                err.message,
+            );
+        });
+    }, debounceMs);
+}
+
+async function drainMessageQueue(chatId) {
+    const queue = getMessageQueue(chatId);
+    if (queue.processing || queue.items.length === 0) {
+        return;
+    }
+
+    queue.processing = true;
+    const batch = queue.items.splice(0);
+
+    try {
+        const combinedText = batch
+            .map((entry) => extractMessageText(entry.msg))
+            .filter(Boolean)
+            .join('\n');
+        const last = batch[batch.length - 1];
+        await processMessage(last.msg, last.chat, combinedText);
+    } finally {
+        queue.processing = false;
+        if (queue.items.length > 0) {
+            await drainMessageQueue(chatId);
+        }
+    }
 }
 
 async function refreshDocumentCatalog() {
+    const { loadCatalog } = require('./lib/documents');
     documentCatalog = await loadCatalog(config.docsRoot);
+    refreshCompanyKnowledge();
     console.log(
         `Documentos indexados: ${documentCatalog.length} em ${config.docsRoot}`,
     );
+}
+
+function startCatalogRefreshTimer() {
+    if (catalogRefreshTimer) clearInterval(catalogRefreshTimer);
+    if (config.catalogRefreshMs <= 0) return;
+
+    catalogRefreshTimer = setInterval(() => {
+        refreshDocumentCatalog().catch((err) => {
+            console.error('Erro ao reindexar documentos:', err.message);
+        });
+    }, config.catalogRefreshMs);
 }
 
 function isAdmin(msg) {
@@ -142,7 +193,25 @@ async function handleAdminCommand(msg) {
     if (text === '!status') {
         const outlook = mailConfigured() ? 'conectado' : 'não configurado';
         await msg.reply(
-            `Status:\n- Bot: ${botPaused ? 'pausado' : 'ativo'}\n- E-mail: ${getModeLabel()} (${outlook})\n- Modelo: ${config.groqModel}\n- Documentos: ${documentCatalog.length}`,
+            `Status:\n` +
+                `- Bot: ${botPaused ? 'pausado' : 'ativo'}\n` +
+                `- IA: ${config.groqModel}\n` +
+                `- Debounce: ${config.messageDebounceMs / 1000}s\n` +
+                `- E-mail: ${getModeLabel()} (${outlook})\n` +
+                `- Documentos: ${documentCatalog.length}`,
+        );
+        return true;
+    }
+
+    if (text === '!ajuda' || text === '!help') {
+        await msg.reply(
+            `Comandos admin:\n` +
+                `!status — status do bot\n` +
+                `!pausar / !ativar — pausar IA\n` +
+                `!docs — reindexar documentos\n` +
+                `!limpar — zerar histórico deste chat\n` +
+                `!liberar [filtro] — liberar escalonamentos\n` +
+                `!meunumero — número do WhatsApp conectado`,
         );
         return true;
     }
@@ -172,39 +241,84 @@ async function handleAdminCommand(msg) {
         return true;
     }
 
+    if (text === '!limpar') {
+        const chat = await msg.getChat();
+        const chatId = chat.id._serialized;
+        const registeredStaff = findRegisteredStaff(chatId, chat.name);
+        const key = await resolveConversationKey(
+            waClient,
+            chatId,
+            registeredStaff,
+        );
+
+        await withConversationState(
+            key,
+            chatId,
+            registeredStaff,
+            async (conversation) => {
+                conversation.history = [];
+                conversation.escalated = false;
+            },
+        );
+
+        await msg.reply(`Histórico desta conversa limpo (${key}).`);
+        return true;
+    }
+
     return false;
 }
 
-async function maybeSendDocument(msg, relativePath) {
-    const filePath = resolveDocument(
-        config.docsRoot,
-        documentCatalog,
-        relativePath,
-    );
-
-    if (!filePath || !fs.existsSync(filePath)) {
-        await msg.reply(
-            'Não achei esse arquivo aqui. Me descreve melhor o que você precisa?',
-        );
-        return;
+async function maybeSendDocuments(msg, relativePaths) {
+    if (relativePaths.length === 0) {
+        return false;
     }
 
-    const media = MessageMedia.fromFilePath(filePath);
-    const caption = path.basename(filePath);
-    await msg.reply(media, undefined, { caption });
+    let sent = 0;
+    for (const relativePath of relativePaths) {
+        const filePath = resolveDocument(
+            config.docsRoot,
+            documentCatalog,
+            relativePath,
+        );
+
+        if (!filePath || !fs.existsSync(filePath)) {
+            console.warn(`Arquivo não encontrado: ${relativePath}`);
+            continue;
+        }
+
+        const media = MessageMedia.fromFilePath(filePath);
+        const caption = path.basename(filePath);
+        await msg.reply(media, undefined, { caption });
+        sent += 1;
+    }
+
+    if (sent === 0) {
+        return false;
+    }
+
+    return true;
 }
 
 function isPrivateChat(chat) {
     return !chat.isGroup && !chat.isChannel;
 }
 
-async function handleEscalation(msg, chat, chatId, registeredStaff, userText) {
-    const states = loadAllStates();
-    const key = getConversationKey(chatId, registeredStaff);
-    const conversation = getConversation(states, key);
-    conversation.escalated = true;
-    conversation.updatedAt = new Date().toISOString();
-    saveAllStates(states);
+async function handleEscalation(
+    msg,
+    chat,
+    chatId,
+    registeredStaff,
+    userText,
+    conversationKey,
+) {
+    await withConversationState(
+        conversationKey,
+        chatId,
+        registeredStaff,
+        async (conversation) => {
+            conversation.escalated = true;
+        },
+    );
 
     await msg.reply(ESCALATION_REPLY);
 
@@ -243,34 +357,25 @@ async function handleMessage(msg) {
         return;
     }
 
-    const chatId = chat.id._serialized;
-
     if (isAdmin(msg) || !config.adminPhone) {
         const handled = await handleAdminCommand(msg);
         if (handled) return;
     }
 
-    const userText = msg.body?.trim();
+    const userText = extractMessageText(msg);
 
     if (!userText) {
         logIncoming(msg, chat, 'empty_body');
-        await msg.reply('Manda em texto que consigo te ajudar melhor 🙂');
+        await msg.reply(SYSTEM.emptyBody);
         return;
     }
 
-    if (isProcessing(chatId)) {
-        logIncoming(msg, chat, 'ignored_busy');
-        try {
-            await msg.reply(
-                'Recebi! Já tô vendo sua mensagem anterior, um instante 👍',
-            );
-        } catch {
-            /* ignore */
-        }
-        return;
-    }
+    logIncoming(msg, chat, 'queued');
+    scheduleMessage(msg, chat);
+}
 
-    processing.set(chatId, Date.now());
+async function processMessage(msg, chat, userText) {
+    const chatId = chat.id._serialized;
     logIncoming(msg, chat, 'processing');
 
     try {
@@ -279,21 +384,34 @@ async function handleMessage(msg) {
             registerChatIdForStaff(registeredStaff.telefone, chatId);
         }
 
-        const states = loadAllStates();
-        const key = getConversationKey(chatId, registeredStaff);
-        const conversation = getConversation(states, key);
+        const conversationKey = await resolveConversationKey(
+            waClient,
+            chatId,
+            registeredStaff,
+        );
+        console.log(`[${chat.name || chatId}] conversa: ${conversationKey}`);
+
+        const conversation = await readConversation(
+            conversationKey,
+            chatId,
+            registeredStaff,
+        );
 
         if (conversation.escalated) {
             if (!matchesHumanKeyword(userText)) {
-                conversation.escalated = false;
-                saveAllStates(states);
+                await withConversationState(
+                    conversationKey,
+                    chatId,
+                    registeredStaff,
+                    async (state) => {
+                        state.escalated = false;
+                    },
+                );
                 console.log(
                     `[${chat.name || chatId}] escalonamento cancelado — nova solicitação`,
                 );
             } else {
-                await msg.reply(
-                    'José já foi avisado. Se quiser, pode ir mandando sua dúvida que registro aqui.',
-                );
+                await msg.reply(SYSTEM.escalationWaiting);
                 appendLog({
                     type: 'message_while_escalated',
                     chatId,
@@ -306,6 +424,11 @@ async function handleMessage(msg) {
         if (botPaused) {
             console.log(`[${chat.name || chatId}] bot pausado — ignorado`);
             appendLog({ type: 'bot_paused', chatId, message: userText });
+            if (isAdmin(msg)) {
+                await msg.reply(
+                    'Bot pausado. Envie !ativar para retomar o atendimento automático.',
+                );
+            }
             return;
         }
 
@@ -322,92 +445,92 @@ async function handleMessage(msg) {
                 chatId,
                 registeredStaff,
                 userText,
+                conversationKey,
             );
             return;
         }
 
-        if (needsSlowLookup(userText)) {
-            console.log(
-                `[${chat.name || chatId}] busca lenta — avisando contato`,
-            );
-            try {
-                await msg.reply('Deixa comigo, vou dar uma olhada aqui…');
-            } catch {
-                /* ignore */
+        await withTyping(chat, async () => {
+            const context = await buildContext(userText, documentCatalog, {
+                hasMedia: msg.hasMedia,
+            });
+
+            if (needsSlowLookup(userText, context.intent)) {
+                console.log(
+                    `[${chat.name || chatId}] busca — avisando contato`,
+                );
+                try {
+                    await msg.reply(SYSTEM.slowLookup);
+                } catch {
+                    /* ignore */
+                }
             }
-        }
 
-        const relevantDocs = await searchCatalog(
-            documentCatalog,
-            userText,
-            config.docsRoot,
-        );
-        const catalogSummary = buildCatalogSummary(
-            documentCatalog,
-            relevantDocs,
-        );
-        const relevantContext = buildRelevantContext(relevantDocs);
+            const { rawReply } = await produceReply({
+                conversation,
+                userText,
+                context,
+                registeredStaff,
+            });
 
-        let emailContext = '';
-        let outlookEnabled = false;
+            const { reply, relativePath, sendPaths, outgoing } =
+                resolveOutgoingFiles(
+                    rawReply,
+                    userText,
+                    documentCatalog,
+                    context.relevantDocs,
+                );
 
-        if (mailConfigured() && shouldSearchOutlook(userText)) {
-            const emailRequest = parseEmailRequest(userText);
-            const emails = await searchEmails(emailRequest);
-            emailContext = buildEmailContext(emails);
-            outlookEnabled = true;
-        }
+            const historyLimit = registeredStaff
+                ? config.historyLimitRegistered
+                : config.historyLimitGuest;
 
-        const rawReply = await generateReply({
-            conversation,
-            userText,
-            catalogSummary,
-            relevantContext,
-            emailContext,
-            registeredStaff,
-            outlookEnabled,
+            await withConversationState(
+                conversationKey,
+                chatId,
+                registeredStaff,
+                async (state) => {
+                    state.history.push(
+                        { role: 'user', content: userText },
+                        { role: 'assistant', content: reply || rawReply },
+                    );
+
+                    if (state.history.length > historyLimit) {
+                        state.history = state.history.slice(-historyLimit);
+                    }
+                },
+            );
+
+            await msg.reply(outgoing);
+
+            const sentFiles =
+                sendPaths.length > 0
+                    ? await maybeSendDocuments(msg, sendPaths)
+                    : false;
+
+            if (relativePath && !sentFiles) {
+                await msg.reply(SYSTEM.fileNotFound);
+            }
+
+            appendLog({
+                type: 'reply',
+                chatId,
+                contact: registeredStaff?.nome || chat.name,
+                registered: Boolean(registeredStaff),
+                intent: context.intent,
+                message: userText,
+                reply: outgoing,
+                file: sendPaths.length === 1 ? sendPaths[0] : sendPaths,
+            });
+
+            console.log(
+                `[${registeredStaff?.nome || chat.name || chatId}] ` +
+                    `[${context.intent}] resposta enviada` +
+                    (sendPaths.length
+                        ? ` + ${sendPaths.length} arquivo(s)`
+                        : ''),
+            );
         });
-
-        const { text: reply, relativePath } = parseSendFileDirective(rawReply);
-
-        conversation.history.push(
-            { role: 'user', content: userText },
-            { role: 'assistant', content: reply || rawReply },
-        );
-
-        const historyLimit = config.historyLimitRegistered;
-
-        if (conversation.history.length > historyLimit) {
-            conversation.history = conversation.history.slice(-historyLimit);
-        }
-
-        conversation.updatedAt = new Date().toISOString();
-        saveAllStates(states);
-
-        const outgoing =
-            reply ||
-            'Beleza, já olhei aqui. Me fala um pouco mais do que você precisa?';
-
-        await msg.reply(outgoing);
-
-        if (relativePath) {
-            await maybeSendDocument(msg, relativePath);
-        }
-
-        appendLog({
-            type: 'reply',
-            chatId,
-            contact: registeredStaff?.nome || chat.name,
-            registered: Boolean(registeredStaff),
-            message: userText,
-            reply: outgoing,
-            file: relativePath,
-        });
-
-        console.log(
-            `[${registeredStaff?.nome || chat.name || chatId}] resposta enviada` +
-                (relativePath ? ` + arquivo: ${relativePath}` : ''),
-        );
     } catch (err) {
         console.error(`[${chatId}] Erro ao processar mensagem:`, err.message);
         appendLog({
@@ -417,14 +540,10 @@ async function handleMessage(msg) {
             stack: err.stack,
         });
         try {
-            await msg.reply(
-                'Opa, deu um probleminha aqui do meu lado. Tenta de novo daqui a pouco, ou fala com o José direto.',
-            );
+            await msg.reply(SYSTEM.error);
         } catch {
             /* ignore */
         }
-    } finally {
-        processing.delete(chatId);
     }
 }
 
@@ -484,14 +603,16 @@ client.on('change_state', (state) => {
 
 client.on('ready', async () => {
     const adminDigits = formatPhoneForAdmin(client.info?.wid);
-    statusLog('Bot Acesso Equipamentos conectado e pronto.');
+    statusLog('Assistente Acesso Equipamentos conectado e pronto.');
     refreshDocumentCatalog().catch((err) => {
         console.error(
             'Erro ao indexar documentos (bot continua ativo):',
             err.message,
         );
     });
+    startCatalogRefreshTimer();
     statusLog(`Modelo IA: ${config.groqModel}`);
+    statusLog(`Debounce mensagens: ${config.messageDebounceMs / 1000}s`);
     statusLog(
         `Expediente: ${config.businessStart}–${config.businessEnd} (${config.timezone})`,
     );
@@ -516,6 +637,24 @@ client.on('auth_failure', (msg) => {
 
 client.on('disconnected', (reason) => {
     console.error('WhatsApp desconectado:', reason);
+    if (reconnecting) return;
+
+    reconnecting = true;
+    statusLog(`Reconectando em ${config.reconnectDelayMs / 1000}s…`);
+
+    setTimeout(() => {
+        client
+            .initialize()
+            .then(() => {
+                statusLog('Reconexão iniciada.');
+            })
+            .catch((err) => {
+                console.error('Falha ao reconectar:', err.message);
+            })
+            .finally(() => {
+                reconnecting = false;
+            });
+    }, config.reconnectDelayMs);
 });
 
 statusLog('Iniciando WhatsApp Web…');
