@@ -8,7 +8,7 @@ const qrcode = require('qrcode-terminal');
 const { Client, LocalAuth, MessageMedia } = require('./index');
 const config = require('./lib/config');
 const { isWithinBusinessHours } = require('./lib/hours');
-const { SYSTEM } = require('./lib/messages');
+const { SYSTEM, getWelcomeMessage } = require('./lib/messages');
 const { isSimpleGreeting } = require('./lib/human-intent');
 const {
     findRegisteredStaff,
@@ -26,20 +26,31 @@ const {
 } = require('./lib/conversations');
 const {
     refreshCompanyKnowledge,
-    extractMessageText,
     withTyping,
     buildContext,
     produceReply,
     resolveOutgoingFiles,
     shouldAnnounceLookup,
 } = require('./lib/assistant');
+const { resolveInboundText, extractMessageText } = require('./lib/media');
+const { shouldIgnoreAsSpam } = require('./lib/spam-filter');
 const { matchesHumanKeyword } = require('./lib/groq');
+const {
+    hasApiKey,
+    getProviderLabel,
+    getChatModel,
+    resolveProviders,
+    getPrimaryProvider,
+    getProviderChain,
+} = require('./lib/llm');
 const { resolveDocument } = require('./lib/documents');
 const { isConfigured: mailConfigured, getModeLabel } = require('./lib/mail');
 
 const ESCALATION_REPLY = SYSTEM.escalation;
 
 const messageQueues = new Map();
+const emptyBodyCooldown = new Map();
+const EMPTY_BODY_COOLDOWN_MS = 120000;
 let documentCatalog = [];
 let botPaused = false;
 let waClient = null;
@@ -129,10 +140,14 @@ async function drainMessageQueue(chatId) {
     const batch = queue.items.splice(0);
 
     try {
-        const combinedText = batch
-            .map((entry) => extractMessageText(entry.msg))
-            .filter(Boolean)
-            .join('\n');
+        const texts = [];
+        for (const entry of batch) {
+            texts.push(await resolveInboundText(entry.msg));
+        }
+        const combinedText = texts.filter(Boolean).join('\n');
+        if (!combinedText) {
+            return;
+        }
         const last = batch[batch.length - 1];
         await processMessage(last.msg, last.chat, combinedText);
     } finally {
@@ -146,10 +161,30 @@ async function drainMessageQueue(chatId) {
 
 async function refreshDocumentCatalog() {
     const { loadCatalog } = require('./lib/documents');
+    const { syncEmbeddingIndex } = require('./lib/embeddings');
     documentCatalog = await loadCatalog(config.docsRoot);
     refreshCompanyKnowledge();
+    const embeddingStats = await syncEmbeddingIndex(
+        documentCatalog,
+        config.docsRoot,
+    );
+
+    let semanticLabel = '';
+    if (embeddingStats.skipped) {
+        semanticLabel = ' | busca semântica: desativada';
+    } else if (embeddingStats.error) {
+        semanticLabel = ' | busca semântica: indisponível';
+    } else if (embeddingStats.backend) {
+        semanticLabel =
+            embeddingStats.backend === 'local'
+                ? ` | semântica local: ${embeddingStats.indexed}`
+                : embeddingStats.backend === 'openai'
+                  ? ` | semântica OpenAI: ${embeddingStats.indexed}`
+                  : ` | semântica Groq: ${embeddingStats.indexed}`;
+    }
+
     console.log(
-        `Documentos indexados: ${documentCatalog.length} em ${config.docsRoot}`,
+        `Documentos indexados: ${documentCatalog.length} em ${config.docsRoot}${semanticLabel}`,
     );
 }
 
@@ -207,14 +242,38 @@ async function handleAdminCommand(msg) {
     }
 
     if (text === '!status') {
+        const {
+            isIndexReady,
+            isEnabled: semanticEnabled,
+            getSearchBackend,
+        } = require('./lib/embeddings');
         const outlook = mailConfigured() ? 'conectado' : 'não configurado';
+        const semanticBackend = getSearchBackend();
         await msg.reply(
             `Status:\n` +
                 `- Bot: ${botPaused ? 'pausado' : 'ativo'}\n` +
-                `- IA: ${config.groqModel}\n` +
+                `- IA: ${getProviderLabel(getPrimaryProvider())} / ${getChatModel()}${
+                    getProviderChain().length > 1
+                        ? ` (fallback: ${getProviderChain()
+                              .slice(1)
+                              .map((p) => getProviderLabel(p))
+                              .join(', ')})`
+                        : ''
+                }\n` +
                 `- Debounce: ${config.messageDebounceMs / 1000}s\n` +
                 `- E-mail: ${getModeLabel()} (${outlook})\n` +
-                `- Documentos: ${documentCatalog.length}`,
+                `- Documentos: ${documentCatalog.length}\n` +
+                `- Busca semântica: ${
+                    semanticEnabled()
+                        ? isIndexReady()
+                            ? semanticBackend === 'openai'
+                                ? 'ativa (OpenAI)'
+                                : semanticBackend === 'groq'
+                                  ? 'ativa (Groq)'
+                                  : 'ativa (local TF-IDF)'
+                            : 'indexando…'
+                        : 'desativada'
+                }`,
         );
         return true;
     }
@@ -329,6 +388,25 @@ function isPrivateChat(chat) {
     return !chat.isGroup && !chat.isChannel;
 }
 
+function isMediaWithoutCaption(msg) {
+    return msg.hasMedia && !msg.body?.trim();
+}
+
+async function isFirstContact(chat, registeredStaff) {
+    const chatId = chat.id._serialized;
+    const conversationKey = await resolveConversationKey(
+        waClient,
+        chatId,
+        registeredStaff,
+    );
+    const conversation = await readConversation(
+        conversationKey,
+        chatId,
+        registeredStaff,
+    );
+    return conversation.history.length === 0;
+}
+
 async function handleEscalation(
     msg,
     chat,
@@ -413,12 +491,44 @@ async function handleMessage(msg) {
         if (handled) return;
     }
 
+    const registeredStaff = findRegisteredStaff(chat.id._serialized, chat.name);
+
+    if (isMediaWithoutCaption(msg)) {
+        const firstContact = await isFirstContact(chat, registeredStaff);
+        if (firstContact) {
+            logIncoming(msg, chat, 'ignored_media_no_prior_chat');
+            return;
+        }
+    }
+
     const userText = extractMessageText(msg);
 
-    if (!userText) {
+    if (!userText && !msg.hasMedia) {
+        const chatId = chat.id._serialized;
+        const lastReply = emptyBodyCooldown.get(chatId) || 0;
+        if (Date.now() - lastReply < EMPTY_BODY_COOLDOWN_MS) {
+            logIncoming(msg, chat, 'ignored_empty_body_cooldown');
+            return;
+        }
+        emptyBodyCooldown.set(chatId, Date.now());
         logIncoming(msg, chat, 'empty_body');
         await sendChatReply(chat, msg, SYSTEM.emptyBody, { quote: false });
         return;
+    }
+
+    if (userText) {
+        const spam = await shouldIgnoreAsSpam(userText, { registeredStaff });
+        if (spam.ignore) {
+            logIncoming(msg, chat, `ignored_spam_${spam.reason}`);
+            appendLog({
+                type: 'spam_ignored',
+                chatId: chat.id._serialized,
+                contact: chat.name,
+                reason: spam.reason,
+                message: userText.slice(0, 240),
+            });
+            return;
+        }
     }
 
     logIncoming(msg, chat, 'queued');
@@ -495,10 +605,22 @@ async function processMessage(msg, chat, userText) {
             return;
         }
 
+        const shouldWelcome =
+            conversation.history.length === 0 &&
+            Boolean(msg.body?.trim()) &&
+            !matchesHumanKeyword(userText);
+
+        if (shouldWelcome) {
+            await sendChatReply(chat, msg, getWelcomeMessage(registeredStaff), {
+                quote: false,
+            });
+        }
+
         await withTyping(chat, async () => {
             const context = await buildContext(userText, documentCatalog, {
                 hasMedia: msg.hasMedia,
                 outsideBusinessHours,
+                conversationHistory: conversation.history,
             });
 
             if (needsSlowLookup(userText, context.intent)) {
@@ -519,12 +641,13 @@ async function processMessage(msg, chat, userText) {
                 userText,
                 context,
                 registeredStaff,
+                documentCatalog,
             });
 
             const { reply, relativePath, sendPaths, outgoing } =
                 resolveOutgoingFiles(
                     rawReply,
-                    userText,
+                    context.searchQuery || userText,
                     documentCatalog,
                     context.relevantDocs,
                 );
@@ -611,12 +734,45 @@ function ensureDataDirs() {
     }
 }
 
-if (!config.groqApiKey) {
-    console.error('Defina GROQ_API_KEY no arquivo .env');
+if (!hasApiKey()) {
+    console.error(
+        'Defina OPENAI_API_KEY, GROQ_API_KEY e/ou GEMINI_API_KEY no .env',
+    );
     process.exit(1);
 }
 
-ensureDataDirs();
+async function boot() {
+    await resolveProviders();
+    ensureDataDirs();
+
+    statusLog('Iniciando WhatsApp Web…');
+    try {
+        await initializeClientWithRetry();
+        statusLog(
+            'Navegador aberto — aguardando sincronização (pode levar 1–2 min)…',
+        );
+        setTimeout(() => {
+            if (!client.info) {
+                statusLog(
+                    'Ainda sincronizando… Se passar de 3 min sem "conectado", feche e rode npm run bot de novo.',
+                );
+            }
+        }, 90000);
+    } catch (err) {
+        console.error('Falha ao iniciar:', err);
+        if (isNetworkError(err)) {
+            logNetworkHint();
+        } else if (isSessionError(err)) {
+            logSessionResetHint();
+        }
+        process.exit(1);
+    }
+}
+
+boot().catch((err) => {
+    console.error('Falha ao iniciar bot:', err.message);
+    process.exit(1);
+});
 
 function buildClientOptions() {
     return {
@@ -795,7 +951,9 @@ client.on('ready', async () => {
         );
     });
     startCatalogRefreshTimer();
-    statusLog(`Modelo IA: ${config.groqModel}`);
+    statusLog(
+        `Modelo IA: ${getProviderLabel(getPrimaryProvider())} / ${getChatModel()}`,
+    );
     statusLog(`Debounce mensagens: ${config.messageDebounceMs / 1000}s`);
     statusLog(
         `Expediente: ${config.businessStart}–${config.businessEnd} (${config.timezone})`,
@@ -833,27 +991,3 @@ client.on('disconnected', (reason) => {
         console.error('Erro ao reconectar:', err.message);
     });
 });
-
-statusLog('Iniciando WhatsApp Web…');
-initializeClientWithRetry()
-    .then(() => {
-        statusLog(
-            'Navegador aberto — aguardando sincronização (pode levar 1–2 min)…',
-        );
-        setTimeout(() => {
-            if (!client.info) {
-                statusLog(
-                    'Ainda sincronizando… Se passar de 3 min sem "conectado", feche e rode npm run bot de novo.',
-                );
-            }
-        }, 90000);
-    })
-    .catch((err) => {
-        console.error('Falha ao iniciar:', err);
-        if (isNetworkError(err)) {
-            logNetworkHint();
-        } else if (isSessionError(err)) {
-            logSessionResetHint();
-        }
-        process.exit(1);
-    });
