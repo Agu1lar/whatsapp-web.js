@@ -23,6 +23,7 @@ const {
     withConversationState,
     readConversation,
     appendLog,
+    startConversationMaintenance,
 } = require('./lib/conversations');
 const {
     refreshCompanyKnowledge,
@@ -951,6 +952,7 @@ client.on('ready', async () => {
         );
     });
     startCatalogRefreshTimer();
+    startConversationMaintenance();
     statusLog(
         `Modelo IA: ${getProviderLabel(getPrimaryProvider())} / ${getChatModel()}`,
     );

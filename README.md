@@ -26,46 +26,68 @@
 > **Este repositório é um fork** de [wwebjs/whatsapp-web.js](https://github.com/wwebjs/whatsapp-web.js) ([upstream](https://github.com/wwebjs/whatsapp-web.js)).  
 > Repositório deste fork: [Agu1lar/whatsapp-web.js](https://github.com/Agu1lar/whatsapp-web.js)
 
-Mantido para o **bot de atendimento da Acesso Equipamentos** (área de tecnologia): assistente virtual do José no WhatsApp, com IA (Groq), consulta de documentos na rede/local e e-mail via Outlook no Windows.
+Mantido para o **bot de atendimento da Acesso Equipamentos** (área de tecnologia): assistente virtual com IA no WhatsApp, consulta de documentos na rede/local, e-mail via Outlook no Windows e encaminhamento ao José quando necessário.
 
 ### Recursos do bot
 
 | Recurso                     | Descrição                                                                                           |
 | --------------------------- | --------------------------------------------------------------------------------------------------- |
-| **IA (Groq / Llama 3.3)**   | Respostas em português, tom profissional de atendimento corporativo                                 |
+| **IA multi-provedor**       | Groq (principal), OpenAI e Gemini com detecção automática na inicialização e fallback em cadeia     |
+| **Anti-alucinação**         | Prompt com grounding, modo só RAG, temperatura baixa para fatos e validação pós-resposta            |
+| **Busca híbrida**           | Palavras-chave + semântica (embeddings ou TF-IDF local) em `DOCS_ROOT`                              |
+| **Contexto de conversa**    | Respostas curtas (ex.: nome do funcionário) usam o pedido anterior para buscar documentos           |
 | **Roteamento por intenção** | Saudação, documento, e-mail, escalonamento humano ou conversa geral                                 |
-| **Documentos**              | Indexa `DOCS_ROOT` (pasta local ou `\\rede`), busca por nome/conteúdo e envio sob demanda           |
-| **Base de conhecimento**    | Arquivos `.md` em `documentos/` entram no contexto da IA                                            |
+| **Documentos**              | Indexa pasta local ou `\\rede`, busca por nome/conteúdo e envio sob demanda                         |
+| **Mídia**                   | Transcrição de áudio (Whisper), leitura de PDF/imagem em conversa ativa                             |
+| **Filtro de spam**          | Ignora faturas, refinanciamento, propaganda e ofertas (regras + IA leve)                            |
+| **Base de conhecimento**    | Arquivos `.md` em `documentos/` e contexto da empresa em `lib/company.js`                           |
 | **Outlook**                 | Lê e-mails quando pedido explicitamente (`OUTLOOK_MODE=com` no Windows)                             |
 | **Expediente humano**       | Seg–sex, 07:30–17:15 — fora disso a IA **continua** atendendo; o José retorna no próximo expediente |
 | **Escalonamento**           | Encaminha ao José em pedidos explícitos (ex.: "falar com o José")                                   |
 | **Histórico por contato**   | Conversas isoladas por telefone (suporte a `@lid` do WhatsApp)                                      |
-| **Debounce**                | Agrupa mensagens seguidas (~0,8s saudações / ~3s demais) antes de responder                         |
+| **Debounce**                | Agrupa mensagens seguidas (~0,8s saudações / ~2s demais) antes de responder                         |
 | **Envio seguro**            | Só envia arquivo com confirmação da IA ou match exato; evita mandar PDF errado                      |
-| **Resiliência**             | Retry na Groq, timeout de rede, reconexão WhatsApp, reindexação automática de docs                  |
+| **Resiliência**             | Retry nas APIs, timeout de rede, reconexão WhatsApp, reindexação automática de docs                 |
 | **Comandos admin**          | `!ping`, `!status`, `!pausar`, `!ativar`, `!docs`, `!limpar`, `!liberar`, `!ajuda`, `!meunumero`    |
 
 ### Comportamento importante
 
+- **Identidade:** a assistente se identifica como IA da área de tecnologia — não simula o José.
+- **Escopo:** documentos, certificados, TI e encaminhamento; comercial e operacional são redirecionados aos contatos corretos.
 - **Teste de outro celular:** mensagens enviadas pelo próprio WhatsApp conectado ao bot são ignoradas (`fromMe`). Use outro aparelho para testar.
 - **Fora do expediente:** dúvidas, busca em documentos e envio de arquivos funcionam normalmente; apenas o retorno **humano** do José fica para o horário comercial.
+- **Follow-up de documentos:** após pedir um certificado, o usuário pode responder só com o nome (ex.: "Diego Pereira") — o bot combina com o contexto da conversa.
+- **Modo só RAG:** se a busca não achar documento/e-mail, responde com mensagem fixa sem chamar a IA (`RAG_ONLY_MODE=true`).
+- **Anexos sem legenda:** ignorados no primeiro contato; em conversa ativa, áudio/PDF/imagem são processados.
 - **Tom:** mensagens fixas em `lib/messages.js` — linguagem profissional, sem parecer o José respondendo pessoalmente.
+- **Histórico:** salvo em `data/conversations.json` com TTL (30 min inativo por padrão) e limpeza periódica.
+- **Segurança de arquivos:** caminhos validados com `safeResolve` — bloqueia `..`, caminhos absolutos e acesso fora de `DOCS_ROOT`.
 
 ### Início rápido
 
-Requisitos: **Node.js 18+**, **Windows** (para Outlook COM), conta [Groq](https://console.groq.com/) com API key, acesso a `https://web.whatsapp.com`.
+Requisitos: **Node.js 18+**, **Windows** (para Outlook COM), pelo menos uma chave de IA (Groq recomendada), acesso a `https://web.whatsapp.com`.
 
 ```powershell
 git clone https://github.com/Agu1lar/whatsapp-web.js.git
 cd whatsapp-web.js
 npm install
 copy .env.example .env
-# Edite .env: GROQ_API_KEY, ADMIN_PHONE, DOCS_ROOT, BUSINESS_END=17:15, etc.
+# Edite .env: GROQ_API_KEY, GEMINI_API_KEY (opcional), ADMIN_PHONE, DOCS_ROOT, etc.
 copy data\funcionarios.example.json data\funcionarios.json
 npm run bot
 ```
 
 Na primeira execução, escaneie o QR Code no terminal. A sessão fica salva em `.wwebjs_auth/` (não versionada).
+
+Na subida, o bot testa as APIs configuradas e exibe qual é a principal e o fallback:
+
+```
+Verificando APIs de IA disponíveis…
+  OpenAI: indisponível
+  Groq: disponível
+  Gemini: disponível (fallback)
+IA principal: Groq | fallback: Gemini
+```
 
 Se der erro de autenticação ou `Target closed`, apague `.wwebjs_auth/session-acesso-bot` e escaneie o QR de novo.
 
@@ -73,21 +95,45 @@ Se der erro de autenticação ou `Target closed`, apague `.wwebjs_auth/session-a
 
 Copie `.env.example` para `.env`. Principais variáveis:
 
-| Variável                                           | Descrição                                                        |
-| -------------------------------------------------- | ---------------------------------------------------------------- |
-| `GROQ_API_KEY`                                     | Chave da API Groq                                                |
-| `GROQ_MODEL`                                       | Modelo (padrão: `llama-3.3-70b-versatile`)                       |
-| `GROQ_REQUEST_TIMEOUT_MS`                          | Timeout por chamada à IA (padrão: 45000)                         |
-| `DOCS_ROOT`                                        | Pasta com documentos (ex.: `\\servidor\pasta` ou `./documentos`) |
-| `ADMIN_PHONE`                                      | Seu número com DDI (55…) — comandos admin e alertas              |
-| `BUSINESS_START` / `BUSINESS_END`                  | Expediente **humano** (padrão: 07:30–**17:15**, seg–sex)         |
-| `MESSAGE_DEBOUNCE_MS`                              | Espera antes de responder (padrão: 3000)                         |
-| `MESSAGE_DEBOUNCE_GREETING_MS`                     | Debounce para saudações (padrão: 800)                            |
-| `HISTORY_LIMIT_REGISTERED` / `HISTORY_LIMIT_GUEST` | Tamanho do histórico na IA                                       |
-| `PUPPETEER_HEADLESS`                               | `false` = janela do Chrome visível (recomendado para depurar)    |
-| `WA_INIT_RETRIES`                                  | Tentativas ao conectar ao WhatsApp Web                           |
-| `OUTLOOK_MODE`                                     | `com` (Outlook desktop) ou `graph` (Azure)                       |
-| `OUTLOOK_USER_EMAIL`                               | Caixa de e-mail consultada                                       |
+#### IA
+
+| Variável                                        | Descrição                                          |
+| ----------------------------------------------- | -------------------------------------------------- |
+| `AI_PROVIDER`                                   | `auto` (padrão), `groq`, `openai` ou `gemini`      |
+| `GROQ_API_KEY`                                  | Chave Groq — recomendada como principal            |
+| `GROQ_MODEL`                                    | Modelo de chat (padrão: `llama-3.3-70b-versatile`) |
+| `GEMINI_API_KEY`                                | Fallback opcional (ex.: `gemini-2.5-flash`)        |
+| `OPENAI_API_KEY`                                | Opcional — chat, Whisper e embeddings              |
+| `AI_PROBE_RETRIES` / `AI_PROBE_TIMEOUT_MS`      | Teste das APIs na inicialização                    |
+| `GROQ_REQUEST_TIMEOUT_MS`                       | Timeout por chamada à IA (padrão: 45000)           |
+| `GROQ_TEMPERATURE` / `GROQ_TEMPERATURE_FACTUAL` | Criatividade geral vs. respostas factuais          |
+
+#### Documentos e busca
+
+| Variável                   | Descrição                                                        |
+| -------------------------- | ---------------------------------------------------------------- |
+| `DOCS_ROOT`                | Pasta com documentos (ex.: `\\servidor\pasta` ou `./documentos`) |
+| `SEMANTIC_SEARCH_ENABLED`  | Busca semântica híbrida (padrão: `true`)                         |
+| `SEMANTIC_SEARCH_MODE`     | `auto`, `openai`, `groq` ou `local` (TF-IDF)                     |
+| `RAG_ONLY_MODE`            | Sem resultado na busca → resposta fixa, sem IA (padrão: `true`)  |
+| `PDF_ENRICH_MAX_ON_SEARCH` | Máx. PDFs lidos por mensagem na rede (padrão: 2)                 |
+| `CATALOG_REFRESH_MS`       | Reindexação automática (padrão: 1h; `0` = desligado)             |
+
+#### Bot e atendimento
+
+| Variável                                           | Descrição                                                            |
+| -------------------------------------------------- | -------------------------------------------------------------------- |
+| `ADMIN_PHONE`                                      | Seu número com DDI (55…) — comandos admin e alertas                  |
+| `BUSINESS_START` / `BUSINESS_END`                  | Expediente **humano** (padrão: 07:30–17:15, seg–sex)                 |
+| `MESSAGE_DEBOUNCE_MS`                              | Espera antes de responder (padrão: 2000)                             |
+| `MESSAGE_DEBOUNCE_GREETING_MS`                     | Debounce para saudações (padrão: 800)                                |
+| `HISTORY_LIMIT_REGISTERED` / `HISTORY_LIMIT_GUEST` | Tamanho do histórico na IA                                           |
+| `CONVERSATION_TTL_MS`                              | Remove conversas inativas do disco (padrão: 30 min; `0` = desligado) |
+| `CONVERSATION_PRUNE_INTERVAL_MS`                   | Intervalo da limpeza automática (padrão: 10 min)                     |
+| `SPAM_FILTER_ENABLED` / `SPAM_FILTER_AI`           | Filtro de spam automático                                            |
+| `PUPPETEER_HEADLESS`                               | `false` = janela do Chrome visível (recomendado para depurar)        |
+| `OUTLOOK_MODE`                                     | `com` (Outlook desktop) ou `graph` (Azure)                           |
+| `OUTLOOK_USER_EMAIL`                               | Caixa de e-mail consultada                                           |
 
 Cadastre funcionários em `data/funcionarios.json` (nome, telefone, setor) para tratamento personalizado.
 
@@ -98,16 +144,23 @@ Arquivos **não versionados** (ver `.gitignore`): `.env`, `data/`, `.wwebjs_auth
 ```
 bot.js                 # Orquestrador: fila, WhatsApp, admin, envio de arquivos
 lib/
-  assistant.js         # Orquestra contexto, IA e resolução de arquivos
-  intent.js            # Classificação de intenção da mensagem
-  groq.js              # Prompt, saudações e chamadas à Groq
-  documents.js         # Indexação, busca e envio de arquivos
+  assistant.js         # Contexto, IA, RAG, follow-up de conversa e arquivos
+  llm.js               # Groq / OpenAI / Gemini — chat, Whisper, embeddings, fallback
+  groq.js              # Prompt do sistema e geração de respostas
+  grounding.js         # Anti-alucinação e modo só RAG
+  embeddings.js        # Busca semântica (API ou TF-IDF local)
+  local-semantic.js    # Índice TF-IDF local (fallback de embeddings)
+  documents.js         # Indexação, busca híbrida e envio de arquivos
+  media.js             # Áudio (Whisper), PDF e imagem
+  spam-filter.js       # Filtro de spam
+  company.js           # Contexto e contatos da Acesso Equipamentos
   knowledge.js         # Carrega .md da empresa
-  messages.js          # Mensagens fixas do sistema (tom profissional)
+  messages.js          # Mensagens fixas do sistema
+  intent.js            # Classificação de intenção
   mail.js              # E-mail (Outlook COM / Graph)
-  hours.js             # Expediente e contexto de data/hora
-  human-intent.js      # Detecção de pedido de atendente / saudação
-  conversations.js     # Histórico por contato e locks de gravação
+  hours.js             # Expediente e data/hora
+  human-intent.js      # Pedido de atendente / saudação
+  conversations.js     # Histórico por contato
   funcionarios.js      # Cadastro de funcionários
 scripts/
   outlook-com-read.ps1
